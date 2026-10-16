@@ -58,7 +58,7 @@ export OPENDESIGN_API_KEY="sk-amr-..."
 ## Development & Testing
 
 ```bash
-# Run unit & live integration tests
+# Run isolated unit tests
 npm test
 
 # Run strict TypeScript verification
