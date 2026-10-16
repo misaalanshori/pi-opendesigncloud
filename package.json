@@ -1,0 +1,30 @@
+{
+  "name": "pi-extension-opendesign",
+  "version": "0.1.0",
+  "description": "Pi extension for OpenDesign AI models provider",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "test": "node --import tsx --test **/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "opendesign",
+    "ai"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.3.0",
+    "@earendil-works/pi-coding-agent": "^1.3.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}
