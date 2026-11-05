@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import test, { describe } from "node:test";
-import type { RefreshModelsContext } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	AssistantMessageEventStream,
+	Model,
+	RefreshModelsContext,
+	TranscriptContext,
+} from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import extensionFactory, {
 	createOpenDesignProviderConfig,
+	isOpenDesignRetryableError,
 	refreshOpenDesignModels,
+	sanitizeOpenDesignErrorMessage,
+	streamOpenDesign,
 } from "../index.ts";
 import {
 	DEFAULT_MODELS,
@@ -245,5 +257,379 @@ describe("OpenDesign Provider Extension", () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
+	});
+
+	test("refreshModels retries on transient 503 and returns models on recovery", async () => {
+		let callCount = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (): Promise<Response> => {
+			callCount++;
+			if (callCount === 1) {
+				return new Response(
+					JSON.stringify({
+						code: "database_unavailable",
+						message: "[code=database_unavailable] resolve Billing Scope: status 503: database_unavailable",
+					}),
+					{ status: 503 },
+				);
+			}
+			return new Response(
+				JSON.stringify({
+					object: "list",
+					data: [{ id: "recovered-model", enabled: true }],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
+
+		try {
+			const context = createMockRefreshContext({
+				allowNetwork: true,
+				credential: { type: "api_key", key: "valid-key" },
+			});
+			const models = await refreshOpenDesignModels(context, OPENDESIGN_BASE_URL, {
+				maxRetries: 2,
+				baseDelayMs: 1,
+			});
+			assert.equal(callCount, 2);
+			assert.equal(models.length, 1);
+			assert.equal(models[0]?.id, "recovered-model");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("isOpenDesignRetryableError correctly classifies retryable vs non-retryable errors", () => {
+		assert.equal(
+			isOpenDesignRetryableError(
+				'Error: 503: {"code":"database_unavailable","message":"[code=database_unavailable] resolve Billing Scope: status 503: database_unavailable","type":"database_unavailable"}',
+			),
+			true,
+		);
+		assert.equal(isOpenDesignRetryableError("502 Bad Gateway"), true);
+		assert.equal(isOpenDesignRetryableError("500 Internal Server Error"), true);
+		assert.equal(isOpenDesignRetryableError("429 Too Many Requests"), true);
+		assert.equal(isOpenDesignRetryableError("TypeError: fetch failed"), true);
+		assert.equal(isOpenDesignRetryableError("read ECONNRESET"), true);
+		assert.equal(isOpenDesignRetryableError("stream ended without finish_reason"), true);
+
+		assert.equal(isOpenDesignRetryableError("Error: 401 Unauthorized"), false);
+		assert.equal(isOpenDesignRetryableError("Error: 404 Not Found"), false);
+		assert.equal(isOpenDesignRetryableError("Error: 400 Bad Request"), false);
+		assert.equal(isOpenDesignRetryableError(undefined), false);
+	});
+
+	test("sanitizeOpenDesignErrorMessage allows Pi's agent-level classifier to retry 503 billing errors", () => {
+		const raw503 =
+			'Error: 503: {"code":"database_unavailable","message":"[code=database_unavailable] resolve Billing Scope: status 503: database_unavailable","type":"database_unavailable"}';
+
+		// Pi built-in classifier rejects the raw error because of the word "Billing"
+		const rawAssistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "openai-completions",
+			provider: OPENDESIGN_PROVIDER_ID,
+			model: "deepseek-v4.1-flash",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: raw503,
+			timestamp: Date.now(),
+		};
+		assert.equal(isRetryableAssistantError(rawAssistantMsg), false);
+
+		// After sanitization, "Billing Scope" is rewritten and Pi classifies 503 as retryable
+		const sanitizedMessage = sanitizeOpenDesignErrorMessage(raw503);
+		assert.ok(!sanitizedMessage.toLowerCase().includes("billing"));
+		const sanitizedAssistantMsg: AssistantMessage = {
+			...rawAssistantMsg,
+			errorMessage: sanitizedMessage,
+		};
+		assert.equal(isRetryableAssistantError(sanitizedAssistantMsg), true);
+	});
+
+	test("streamOpenDesign transparently retries on transient 503 and delivers completion", async () => {
+		let attempts = 0;
+		const mockModel: Model<"openai-completions"> = {
+			id: "deepseek-v4.1-flash",
+			name: "DeepSeek V4.1 Flash",
+			api: "openai-completions",
+			provider: OPENDESIGN_PROVIDER_ID,
+			baseUrl: OPENDESIGN_BASE_URL,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			reasoning: true,
+			contextWindow: 1048000,
+			maxTokens: 32000,
+		};
+		const mockContext: TranscriptContext = {
+			messages: [],
+		} as unknown as TranscriptContext;
+
+		const mockStreamFn = () => {
+			attempts++;
+			const inner = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (attempts === 1) {
+					inner.push({
+						type: "error",
+						reason: "error",
+						error: {
+							role: "assistant",
+							content: [],
+							api: "openai-completions",
+							provider: OPENDESIGN_PROVIDER_ID,
+							model: mockModel.id,
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "error",
+							errorMessage:
+								'Error: 503: {"code":"database_unavailable","message":"[code=database_unavailable] resolve Billing Scope: status 503: database_unavailable","type":"database_unavailable"}',
+							timestamp: Date.now(),
+						},
+					});
+					inner.end();
+				} else {
+					const msg: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: "Hello from OpenDesign!" }],
+						api: "openai-completions",
+						provider: OPENDESIGN_PROVIDER_ID,
+						model: mockModel.id,
+						usage: {
+							input: 10,
+							output: 5,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 15,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					inner.push({ type: "start", partial: msg });
+					inner.push({ type: "text_start", contentIndex: 0, partial: msg });
+					inner.push({ type: "text_delta", contentIndex: 0, delta: "Hello from OpenDesign!", partial: msg });
+					inner.push({ type: "text_end", contentIndex: 0, content: "Hello from OpenDesign!", partial: msg });
+					inner.push({ type: "done", reason: "stop", message: msg });
+					inner.end();
+				}
+			});
+			return inner;
+		};
+
+		const stream = streamOpenDesign(
+			mockModel,
+			mockContext,
+			undefined,
+			mockStreamFn,
+			{ maxRetries: 3, baseDelayMs: 1, maxDelayMs: 10 },
+		);
+
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		assert.equal(attempts, 2);
+		const startEvents = events.filter((e) => e.type === "start");
+		assert.equal(startEvents.length, 1, "Only one start event should be emitted to consumer");
+		const doneEvent = events.find((e) => e.type === "done");
+		assert.ok(doneEvent);
+	});
+
+	test("streamOpenDesign exhausts retries and emits sanitized error", async () => {
+		let attempts = 0;
+		const mockModel: Model<"openai-completions"> = {
+			id: "deepseek-v4.1-flash",
+			name: "DeepSeek V4.1 Flash",
+			api: "openai-completions",
+			provider: OPENDESIGN_PROVIDER_ID,
+			baseUrl: OPENDESIGN_BASE_URL,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			reasoning: true,
+			contextWindow: 1048000,
+			maxTokens: 32000,
+		};
+		const mockContext: TranscriptContext = {
+			messages: [],
+		} as unknown as TranscriptContext;
+
+		const mockStreamFn = () => {
+			attempts++;
+			const inner = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				inner.push({
+					type: "error",
+					reason: "error",
+					error: {
+						role: "assistant",
+						content: [],
+						api: "openai-completions",
+						provider: OPENDESIGN_PROVIDER_ID,
+						model: mockModel.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "error",
+						errorMessage:
+							'Error: 503: {"code":"database_unavailable","message":"[code=database_unavailable] resolve Billing Scope: status 503: database_unavailable","type":"database_unavailable"}',
+						timestamp: Date.now(),
+					},
+				});
+				inner.end();
+			});
+			return inner;
+		};
+
+		const stream = streamOpenDesign(
+			mockModel,
+			mockContext,
+			undefined,
+			mockStreamFn,
+			{ maxRetries: 2, baseDelayMs: 1, maxDelayMs: 5 },
+		);
+
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		assert.equal(attempts, 3); // initial attempt + 2 retries
+		assert.equal(events.length, 1);
+		const errEvent = events[0];
+		assert.ok(errEvent && errEvent.type === "error");
+		assert.ok(errEvent.error.errorMessage);
+		assert.ok(!errEvent.error.errorMessage.toLowerCase().includes("billing"));
+		assert.ok(isRetryableAssistantError(errEvent.error));
+	});
+
+	test("streamOpenDesign does not retry non-retryable 401 error", async () => {
+		let attempts = 0;
+		const mockModel: Model<"openai-completions"> = {
+			id: "deepseek-v4.1-flash",
+			name: "DeepSeek V4.1 Flash",
+			api: "openai-completions",
+			provider: OPENDESIGN_PROVIDER_ID,
+			baseUrl: OPENDESIGN_BASE_URL,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			reasoning: true,
+			contextWindow: 1048000,
+			maxTokens: 32000,
+		};
+		const mockContext: TranscriptContext = {
+			messages: [],
+		} as unknown as TranscriptContext;
+
+		const mockStreamFn = () => {
+			attempts++;
+			const inner = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				inner.push({
+					type: "error",
+					reason: "error",
+					error: {
+						role: "assistant",
+						content: [],
+						api: "openai-completions",
+						provider: OPENDESIGN_PROVIDER_ID,
+						model: mockModel.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "error",
+						errorMessage: "Error: 401 Invalid API Key",
+						timestamp: Date.now(),
+					},
+				});
+				inner.end();
+			});
+			return inner;
+		};
+
+		const stream = streamOpenDesign(
+			mockModel,
+			mockContext,
+			undefined,
+			mockStreamFn,
+			{ maxRetries: 3, baseDelayMs: 1, maxDelayMs: 5 },
+		);
+
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		assert.equal(attempts, 1, "Should not retry 401 error");
+		assert.equal(events.length, 1);
+		assert.equal(events[0]?.type, "error");
+	});
+
+	test("streamOpenDesign aborts immediately when signal is aborted", async () => {
+		const abortController = new AbortController();
+		abortController.abort();
+
+		const mockModel: Model<"openai-completions"> = {
+			id: "deepseek-v4.1-flash",
+			name: "DeepSeek V4.1 Flash",
+			api: "openai-completions",
+			provider: OPENDESIGN_PROVIDER_ID,
+			baseUrl: OPENDESIGN_BASE_URL,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			reasoning: true,
+			contextWindow: 1048000,
+			maxTokens: 32000,
+		};
+		const mockContext: TranscriptContext = {
+			messages: [],
+		} as unknown as TranscriptContext;
+
+		let attempts = 0;
+		const mockStreamFn = () => {
+			attempts++;
+			return createAssistantMessageEventStream();
+		};
+
+		const stream = streamOpenDesign(
+			mockModel,
+			mockContext,
+			{ signal: abortController.signal },
+			mockStreamFn,
+		);
+
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		assert.equal(attempts, 0);
+		assert.equal(events.length, 1);
+		assert.equal(events[0]?.type, "error");
+		assert.equal(events[0]?.reason, "aborted");
 	});
 });
