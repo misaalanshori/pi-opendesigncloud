@@ -19,9 +19,10 @@ import {
 	parseOpenDesignModels,
 } from "./models.ts";
 
-export const DEFAULT_STREAM_MAX_RETRIES = 3;
-export const DEFAULT_BASE_DELAY_MS = 500;
-export const DEFAULT_MAX_DELAY_MS = 8000;
+export const DEFAULT_STREAM_MAX_RETRIES = 5;
+export const DEFAULT_BASE_DELAY_MS = 1000;
+export const DEFAULT_MAX_DELAY_MS = 20000;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
 
 export interface OpenDesignRetryOptions {
 	maxRetries?: number;
@@ -73,32 +74,73 @@ export function computeRetryDelay(
 			}
 		}
 	}
-	const base = baseDelayMs * 2 ** attempt;
-	const jitter = base * (0.8 + Math.random() * 0.4);
-	return Math.min(jitter, maxDelayMs);
+	const expDelay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
+	// Equal jitter: guaranteed half backoff + random half backoff
+	const half = expDelay / 2;
+	return half + Math.random() * half;
 }
+
+const RETRYABLE_STATUS_PATTERN = /\b(500|502|503|504|520|521|522|523|524|525|526|529|429|408)\b/;
+
+const RETRYABLE_TEXT_PATTERNS = [
+	"database_unavailable",
+	"server_busy",
+	"servers are currently busy",
+	"currently experiencing high demand",
+	"model is at capacity",
+	"overloaded",
+	"rate.?limit",
+	"too many requests",
+	"service.?(?:is.?)?(?:temporarily.?)?unavailable",
+	"server.?error",
+	"internal.?error",
+	"bad.?gateway",
+	"gateway.?timeout",
+	"provider.?returned.?(?:an.?)?error",
+	"unable to forward upstream",
+	"upstream.?connect",
+	"reset before headers",
+	"network.?error",
+	"connection.?error",
+	"connection.?refused",
+	"connection.?lost",
+	"connection.?reset",
+	"other side closed",
+	"fetch failed",
+	"socket hang up",
+	"socket connection was closed",
+	"timed? out",
+	"timeout",
+	"terminated",
+	"ended without",
+	"stream ended before",
+	"premature close",
+	"econnreset",
+	"etimedout",
+	"enotfound",
+	"econnrefused",
+	"und_err",
+];
+const RETRYABLE_TEXT_REGEX = new RegExp(RETRYABLE_TEXT_PATTERNS.join("|"), "i");
 
 export function isOpenDesignRetryableError(errorMessage: string | undefined): boolean {
 	if (!errorMessage) return false;
-	if (/\b(500|502|503|504|520|521|522|524|529|429|408)\b/.test(errorMessage)) return true;
-	if (/database_unavailable|server_busy|overloaded/i.test(errorMessage)) return true;
+	// Deterministic client errors fail fast unless also carrying 5xx
 	if (
-		/fetch failed|network.?error|connection.?error|connection.?lost|connection.?reset|socket hang up|ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED/i.test(
-			errorMessage,
-		)
+		/\b(400|401|403|404)\b/.test(errorMessage) &&
+		!/\b(500|502|503|504|520|521|522|523|524|525|526|529)\b/.test(errorMessage)
 	) {
-		return true;
+		return false;
 	}
-	if (/service.?(?:is.?)?(?:temporarily.?)?unavailable/i.test(errorMessage)) return true;
-	if (/stream ended without finish_reason|ended without/i.test(errorMessage)) return true;
-	return false;
+	if (RETRYABLE_STATUS_PATTERN.test(errorMessage)) return true;
+	return RETRYABLE_TEXT_REGEX.test(errorMessage);
 }
 
 export function sanitizeOpenDesignErrorMessage(message: string): string {
 	// OpenDesign transient 503 errors include "[code=database_unavailable] resolve Billing Scope: status 503: database_unavailable".
 	// The word "billing" triggers Pi's NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN, treating transient 503 outages
-	// as non-retryable account quota exhaustion. We rewrite "Billing Scope" so Pi recognizes the 503 status.
-	if (/\b(500|502|503|504|520|524|database_unavailable)\b/i.test(message)) {
+	// as non-retryable account quota exhaustion. We rewrite "Billing" on any 5xx/database errors so Pi recognizes the retryable status.
+	if (/\b(500|502|503|504|520|521|522|523|524|525|526|529|database_unavailable)\b/i.test(message)) {
 		return message.replace(/billing([-_ ]?(scope|db|database|service))?/gi, "service scope");
 	}
 	return message.replace(/billing[-_ ]?scope/gi, "service scope");
@@ -148,6 +190,10 @@ export function streamOpenDesign(
 			: DEFAULT_STREAM_MAX_RETRIES);
 	const baseDelayMs = retryConfig?.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
 	const maxDelayMs = options?.maxRetryDelayMs ?? retryConfig?.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+	const attemptOptions: SimpleStreamOptions = {
+		timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+		...options,
+	};
 
 	(async () => {
 		for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -162,13 +208,13 @@ export function streamOpenDesign(
 			}
 
 			let hasEmittedContent = false;
-			let bufferedStart: AssistantMessageEvent | undefined;
+			let bufferedEvents: AssistantMessageEvent[] = [];
 
 			try {
 				const innerStream = effectiveStreamFn(
 					model as Model<"openai-completions">,
 					context,
-					options,
+					attemptOptions,
 				);
 
 				let shouldRetry = false;
@@ -191,21 +237,65 @@ export function streamOpenDesign(
 							shouldRetry = true;
 							break;
 						}
+						for (const buf of bufferedEvents) stream.push(buf);
+						bufferedEvents = [];
 						lastErrorEvent = event;
 						break;
 					}
 
-					if (event.type === "start") {
-						bufferedStart = event;
+					if (event.type === "start" || event.type === "text_start" || event.type === "thinking_start") {
+						if (!hasEmittedContent) {
+							bufferedEvents.push(event);
+						} else {
+							stream.push(event);
+						}
 						continue;
 					}
 
-					if (bufferedStart) {
-						stream.push(bufferedStart);
-						bufferedStart = undefined;
+					if (event.type === "text_delta" || event.type === "thinking_delta") {
+						if (event.delta.length === 0) continue;
+						if (!hasEmittedContent) {
+							for (const buf of bufferedEvents) stream.push(buf);
+							bufferedEvents = [];
+							hasEmittedContent = true;
+						}
+						stream.push(event);
+						continue;
 					}
 
-					hasEmittedContent = true;
+					if (
+						event.type === "toolcall_start" ||
+						event.type === "toolcall_delta" ||
+						event.type === "toolcall_end"
+					) {
+						if (!hasEmittedContent) {
+							for (const buf of bufferedEvents) stream.push(buf);
+							bufferedEvents = [];
+							hasEmittedContent = true;
+						}
+						stream.push(event);
+						continue;
+					}
+
+					if (event.type === "text_end" || event.type === "thinking_end") {
+						if (hasEmittedContent) {
+							stream.push(event);
+						} else {
+							bufferedEvents.push(event);
+						}
+						continue;
+					}
+
+					if (event.type === "done") {
+						if (!hasEmittedContent) {
+							for (const buf of bufferedEvents) stream.push(buf);
+							bufferedEvents = [];
+							hasEmittedContent = true;
+						}
+						stream.push(event);
+						continue;
+					}
+
 					stream.push(event);
 				}
 
@@ -236,9 +326,9 @@ export function streamOpenDesign(
 					return;
 				}
 
-				if (bufferedStart) {
-					stream.push(bufferedStart);
-					bufferedStart = undefined;
+				if (bufferedEvents.length > 0) {
+					for (const buf of bufferedEvents) stream.push(buf);
+					bufferedEvents = [];
 				}
 				stream.end();
 				return;
@@ -305,8 +395,8 @@ export async function refreshOpenDesignModels(
 
 	if (!apiKey) return DEFAULT_MODELS;
 
-	const maxRetries = retryOptions?.maxRetries ?? 2;
-	const baseDelayMs = retryOptions?.baseDelayMs ?? 100;
+	const maxRetries = retryOptions?.maxRetries ?? 3;
+	const baseDelayMs = retryOptions?.baseDelayMs ?? 250;
 
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		if (context.signal?.aborted) return DEFAULT_MODELS;
