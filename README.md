@@ -17,6 +17,7 @@ Preconfigured with the OpenDesign model catalog:
 | Model ID | Context Limit | Output Budget | Modalities |
 |---|---|---|---|
 | `deepseek-v4.1-flash` *(default)* | 1,048,000 | 32,000 | text, image |
+| `deepseek-v4.1-flash-eco` | 1,048,000 | 32,000 | text |
 | `deepseek-v4-flash` | 1,048,000 | 32,000 | text |
 | `deepseek-v4-flash-vision-exp` | 1,048,000 | 32,000 | text, image |
 | `deepseek-v4-pro` | 1,048,000 | 32,000 | text |

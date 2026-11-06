@@ -102,6 +102,15 @@ export const DEFAULT_MODELS: OpenDesignModelConfig[] = [
 		maxTokens: 32000,
 	},
 	{
+		id: "deepseek-v4.1-flash-eco",
+		name: "DeepSeek V4.1 Flash Eco",
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		reasoning: true,
+		contextWindow: 1048000,
+		maxTokens: 32000,
+	},
+	{
 		id: "deepseek-v4-flash",
 		name: "DeepSeek V4 Flash",
 		input: ["text"],
